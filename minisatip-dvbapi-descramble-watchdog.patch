@@ -1,0 +1,250 @@
+From 02d40629c4a638699c273697c05cdc2cfec22682 Mon Sep 17 00:00:00 2001
+From: MRGs-Solutions <admin@mrgs-solutions.com>
+Date: Sat, 7 Feb 2026 17:25:52 +0200
+Subject: [PATCH] dvbapi: add descramble watchdog and extend CW lifetime
+
+Add a PMT-level watchdog to detect DVBAPI descramble stalls (scrambled TS continues but no successful decrypt) and recover by clearing CWs + resending CAPMT once, with a hard fallback restart. Also keep DVBAPI CWs for 180s to avoid parity-switch freezes when parity is unchanged for longer than the default CW timeout.
+
+Co-Authored-By: Warp <agent@warp.dev>
+---
+ src/dvbapi.cpp |   7 ++-
+ src/dvbapi.h   |   1 +
+ src/pmt.cpp    | 126 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/pmt.h      |   5 ++
+ 4 files changed, 138 insertions(+), 1 deletion(-)
+
+diff --git a/src/dvbapi.cpp b/src/dvbapi.cpp
+index e4d5ec5..46b199b 100644
+--- a/src/dvbapi.cpp
++++ b/src/dvbapi.cpp
+@@ -56,6 +56,8 @@ int dvbapi_sock = -1;
+ int sock;
+ int dvbapi_is_enabled = 0;
+ int enabledKeys = 0;
++
++int dvbapi_enabled() { return dvbapi_is_enabled; }
+ int network_mode = 1;
+ int dvbapi_protocol_version = DVBAPI_PROTOCOL_VERSION;
+ int dvbapi_ca = -1;
+@@ -318,7 +320,10 @@ int dvbapi_reply(sockets *s) {
+                     k_id, parity, index, k->algo, correct ? "OK" : "NOK", cw[0],
+                     cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw[7]);
+ 
+-                send_cw(k->pmt_id, k->algo, parity, cw, NULL, 0, &k->icam_ecm);
++                // Some systems may keep the same parity for >45s; keep CWs longer to
++                // avoid short freezes on parity switch when the "other" parity CW
++                // expired on our side.
++                send_cw(k->pmt_id, k->algo, parity, cw, NULL, 180, &k->icam_ecm);
+             } else
+                 LOG("dvbapi: invalid DVBAPI_CA_SET_DESCR, key %d parity %d, k "
+                     "%p, "
+diff --git a/src/dvbapi.h b/src/dvbapi.h
+index 22c478c..f8dc65b 100644
+--- a/src/dvbapi.h
++++ b/src/dvbapi.h
+@@ -95,6 +95,7 @@ int decrypt_stream(adapter *ad, void *arg);
+ int keys_add(int i, int adapter, int pmt_id);
+ int keys_del(int i);
+ int dvbapi_process_pmt(unsigned char *b, adapter *ad);
++int dvbapi_send_pmt(SKey *k, int cmd_id);
+ void dvbapi_pid_add(adapter *a, int pid, SPid *cp, int existing);
+ void dvbapi_pid_del(adapter *a, int pid, SPid *cp);
+ void register_dvbapi();
+diff --git a/src/pmt.cpp b/src/pmt.cpp
+index 9250ae3..81cf34b 100644
+--- a/src/pmt.cpp
++++ b/src/pmt.cpp
+@@ -925,6 +925,12 @@ int decrypt_batch(SPMT *pmt) {
+          pmt->blen, pmt->sid, pid);
+     for (i = 0; i < pmt->blen; i++)
+         pmt->batch[i].data[3] &= 0x3F; // clear the encrypted flags
++
++    // Successful decrypt - update watchdog state.
++    pmt->last_descramble_ok = getTick();
++    pmt->descramble_fail_start = 0;
++    pmt->descramble_watchdog_resend_pmt = 0;
++
+     pmt->blen = 0;
+ 
+     return 0;
+@@ -941,6 +947,7 @@ int pmt_decrypt_stream(adapter *ad) {
+     int rlen = ad->rlen;
+     int pmt_id[rlen / DVB_FRAME + 10];
+     int pmt_ids = 0;
++    int64_t now = getTick();
+ 
+     memset(pmt_id, -1, sizeof(pmt_id));
+ 
+@@ -961,6 +968,10 @@ int pmt_decrypt_stream(adapter *ad) {
+             master = get_pmt(pmt->master_pmt);
+             if (master)
+                 pmt = master;
++
++            // Mark that we are still seeing scrambled TS for this PMT.
++            pmt->last_scrambled = now;
++
+             cp = ((b[3] & 0x40) > 0);
+ 
+             if (pmt->parity == -1)
+@@ -1117,6 +1128,105 @@ void mark_pids_null(adapter *ad) {
+     }
+ }
+ 
++#ifndef DISABLE_DVBAPI
++static void descramble_watchdog(adapter *ad) {
++    if (!ad)
++        return;
++
++    // Only relevant for DVBAPI descrambling.
++    if (!dvbapi_enabled())
++        return;
++
++    // Safety: no active PMTs or no CA enabled on this adapter.
++    if (ad->active_pmts <= 0 || ad->ca_mask == 0)
++        return;
++
++    // Tuning constants (milliseconds).
++    static const int64_t STALL_MS = 3000;      // scrambled TS, but no decrypt ok
++    static const int64_t GRACE_MS = 5000;      // don't trigger right after start
++    static const int64_t COOLDOWN_MS = 5000;   // rate-limit recovery actions
++    static const int64_t SCRAMBLED_RECENT_MS = 2000; // must be seeing scrambled TS
++
++    int64_t now = getTick();
++
++    for (int i = 0; i < ad->active_pmts; i++) {
++        SPMT *pmt = get_pmt(ad->active_pmt[i]);
++        if (!pmt)
++            continue;
++
++        // Watch only master PMTs.
++        if (pmt->master_pmt != pmt->id)
++            continue;
++
++        if (pmt->state != PMT_RUNNING)
++            continue;
++
++        // Only for encrypted services (have CA descriptors / CAIDs).
++        if (pmt->caids <= 0)
++            continue;
++
++        // Make sure the dvbapi key is still attached.
++        if (!pmt->opaque)
++            continue;
++
++        // Avoid interfering while the PMT is just starting.
++        if (pmt->start_time > 0 && (now - pmt->start_time) < GRACE_MS)
++            continue;
++
++        // If we are not currently seeing scrambled packets, reset fail state.
++        if (pmt->last_scrambled == 0 ||
++            (now - pmt->last_scrambled) > SCRAMBLED_RECENT_MS) {
++            pmt->descramble_fail_start = 0;
++            pmt->descramble_watchdog_resend_pmt = 0;
++            continue;
++        }
++
++        // If we decrypted after the last scrambled packet, everything is OK.
++        if (pmt->last_descramble_ok >= pmt->last_scrambled) {
++            pmt->descramble_fail_start = 0;
++            pmt->descramble_watchdog_resend_pmt = 0;
++            continue;
++        }
++
++        if (pmt->descramble_fail_start == 0)
++            pmt->descramble_fail_start = now;
++
++        if ((now - pmt->descramble_fail_start) < STALL_MS)
++            continue;
++
++        if (pmt->last_descramble_restart > 0 &&
++            (now - pmt->last_descramble_restart) < COOLDOWN_MS)
++            continue;
++
++        pmt->last_descramble_restart = now;
++        pmt->descramble_fail_start = now;
++
++        // Clear CWs (both parities) to force fresh decrypt state.
++        clear_cw_for_pmt(pmt->id, 0);
++        clear_cw_for_pmt(pmt->id, 1);
++        pmt->update_cw = 1;
++
++        // Soft recovery: resend CAPMT once.
++        if (!pmt->descramble_watchdog_resend_pmt) {
++            SKey *k = (SKey *)pmt->opaque;
++            if (k && k->enabled) {
++                pmt->descramble_watchdog_resend_pmt = 1;
++                LOG("Descramble watchdog: resending CAPMT for PMT %d (%s)",
++                    pmt->id, pmt->name);
++                dvbapi_send_pmt(k, CMD_ID_OK_DESCRAMBLING);
++                continue;
++            }
++        }
++
++        // Hard fallback: stop and let tables/CA logic re-add the PMT.
++        pmt->descramble_watchdog_resend_pmt = 0;
++        LOG("Descramble watchdog: restarting PMT %d (%s)", pmt->id, pmt->name);
++        stop_pmt(pmt, ad);
++        pmt->update_cw = 1;
++    }
++}
++#endif
++
+ #define MAKE_KEY(pid, sid) (((pid) << 8) | (sid))
+ void emulate_add_all_pids(adapter *ad) {
+     std::unordered_set<int> pids;
+@@ -1267,6 +1377,10 @@ int pmt_process_stream(adapter *ad) {
+ 
+     mark_pids_null(ad);
+ 
++#ifndef DISABLE_DVBAPI
++    descramble_watchdog(ad);
++#endif
++
+ #endif
+     adapter_commit(ad);
+ 
+@@ -1296,6 +1410,11 @@ int pmt_add(int adapter, int sid, int pmt_pid) {
+     pmt->update_cw = 1;
+     pmt->blen = 0;
+     pmt->last_update_cw = 0;
++    pmt->last_descramble_ok = 0;
++    pmt->last_scrambled = 0;
++    pmt->descramble_fail_start = 0;
++    pmt->last_descramble_restart = 0;
++    pmt->descramble_watchdog_resend_pmt = 0;
+     pmt->filter = -1;
+     pmt->enabled = 1;
+     pmt->version = -1;
+@@ -2027,6 +2146,13 @@ void start_pmt(SPMT *pmt, adapter *ad) {
+     pmt->state = PMT_STARTING;
+     pmt->start_time = getTick();
+ 
++    // Reset descramble watchdog state on (re)start.
++    pmt->last_descramble_ok = 0;
++    pmt->last_scrambled = 0;
++    pmt->descramble_fail_start = 0;
++    pmt->last_descramble_restart = 0;
++    pmt->descramble_watchdog_resend_pmt = 0;
++
+     // do not call send_pmt_to_cas to allow all the slave PMTs to be read
+     // when the master PMT is being sent next time, it will actually making
+     // it to all CAs
+diff --git a/src/pmt.h b/src/pmt.h
+index 379713a..2ada2a1 100644
+--- a/src/pmt.h
++++ b/src/pmt.h
+@@ -144,6 +144,11 @@ typedef struct struct_pmt {
+     SPMT_batch *batch;
+     int8_t parity, update_cw;
+     uint64_t last_update_cw;
++    int64_t last_descramble_ok;
++    int64_t last_scrambled;
++    int64_t descramble_fail_start;
++    int64_t last_descramble_restart;
++    uint8_t descramble_watchdog_resend_pmt;
+     int16_t master_pmt; //  the pmt that contains the same pids as this PMT
+     SCW *cw;
+     SPid *p;
+-- 
+2.51.2
+
